@@ -3,125 +3,183 @@ import numpy as np
 import os
 import sys
 import argparse
-from datetime import datetime
-from resonance import SpectralDetector
+import logging
+from resonance import SpectralDetector, ResonanceEvent
+from resonance.filters import Debouncer
 
-# --- CONFIGURATION ---
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 TRIGGER_FILE = "trigger.txt"
 
-# --- DATA GENERATION (SIMULATION) ---
-def get_metrics(is_attack=False):
-    if not is_attack:
-        return [
-            np.random.normal(15, 0.5), # CPU
-            np.random.normal(5, 0.2),  # Jitter
-            np.random.normal(20, 0.5)  # Memory
-        ]
+_last_net_io = 0
+_last_disk_io = 0
+_first_run_io = True
+
+# --- DATA GENERATION ---
+def get_metrics(is_attack=False, use_real=False, invert_sim=False):
+    """
+    Returns a vector of 3 metrics.
+    Mode REAL: [CPU%, Net_IO_KB, Disk_IO_KB]
+    Mode SIM:  [CPU%, Jitter, Memory%]
+    """
+    global _last_net_io, _last_disk_io, _first_run_io
+    
+    if use_real and PSUTIL_AVAILABLE:
+        real_cpu = psutil.cpu_percent(interval=None)
+        
+        net_counters = psutil.net_io_counters()
+        curr_net = net_counters.bytes_sent + net_counters.bytes_recv
+        
+        disk_counters = psutil.disk_io_counters()
+        curr_disk = disk_counters.read_bytes + disk_counters.write_bytes
+        
+        if _first_run_io:
+            _last_net_io = curr_net
+            _last_disk_io = curr_disk
+            _first_run_io = False
+            return [real_cpu, 0.0, 0.0]
+
+        net_delta = (curr_net - _last_net_io) / 1024.0
+        disk_delta = (curr_disk - _last_disk_io) / 1024.0
+        
+        _last_net_io = curr_net
+        _last_disk_io = curr_disk
+
+        if is_attack:
+            net_delta += np.random.normal(5000, 1000)
+
+        return [real_cpu, net_delta, disk_delta]
+    
     else:
-        return [
-            np.random.normal(85, 10),  # CPU Spike
-            np.random.normal(120, 30), # Jitter Chaos
-            np.random.normal(60, 5)    # Memory Leak
+        low_profile = [
+            np.random.normal(15, 0.5), # Low CPU
+            np.random.normal(5, 0.2),  # Low Jitter
+            np.random.normal(20, 0.5)  # Low Mem
         ]
+        high_profile = [
+            np.random.normal(85, 5),   # High CPU
+            np.random.normal(120, 30), # High Jitter
+            np.random.normal(80, 5)    # High Mem
+        ]
+
+        if invert_sim:
+            return low_profile if is_attack else high_profile
+        else:
+            return high_profile if is_attack else low_profile
 
 # --- SHARED: TRAINING ---
-def train_engine():
-    """Trains the engine and returns the detector."""
-    # We write to stderr so it doesn't mess up the --stream CSV output
-    print(">>> Resonance Core: Initializing Neural Interfaces...", file=sys.stderr)
-    time.sleep(1) # Dramatic pause for "loading"
+def train_engine(quiet=False, use_real=False, sensitivity=0.02, invert=False):
+    if quiet:
+        logging.getLogger("resonance").setLevel(logging.ERROR)
+    else:
+        print(">>> Resonance Core v0.2.0: Initializing...", file=sys.stderr)
+        time.sleep(1) 
     
-    detector = SpectralDetector(mode='statistical', contamination=0.001)
-    
-    # Generate baseline data with simulated "Hardware Polling" delay
+    if use_real and PSUTIL_AVAILABLE:
+        check_cpu = psutil.cpu_percent(interval=1.0)
+        if check_cpu > 25.0:
+             if not quiet:
+                print(f"!!! WARNING: High CPU Load detected ({check_cpu}%).", file=sys.stderr)
+                print("!!! Training on a busy system will mark high load as 'Normal'.", file=sys.stderr)
+                time.sleep(2)
+
+    detector = SpectralDetector(mode='statistical', contamination=sensitivity)
     training_data = []
-    print(">>> Resonance Core: Sampling Hardware Biometrics (200 samples)...", file=sys.stderr)
     
-    # Create a simple progress bar effect
-    toolbar_width = 40
-    sys.stderr.write("[%s]" % (" " * toolbar_width))
-    sys.stderr.flush()
-    sys.stderr.write("\b" * (toolbar_width + 1)) # Return to start of line, after '['
+    get_metrics(use_real=use_real, invert_sim=invert)
+    time.sleep(0.1)
 
-    for i in range(toolbar_width):
-        # Simulate gathering a batch of data from the router
-        for _ in range(5): 
-            training_data.append(get_metrics(is_attack=False))
-        
-        # Update progress bar
-        sys.stderr.write("-")
+    if not quiet:
+        mode_str = "REAL SENSORS" if use_real else "SIMULATED SENSORS"
+        print(f">>> Resonance Core: Sampling {mode_str} (200 samples)...", file=sys.stderr)
+        toolbar_width = 40
+        sys.stderr.write("[%s]" % (" " * toolbar_width))
         sys.stderr.flush()
-        
-        # THIS IS THE THEATRICAL DELAY
-        # Simulating network latency/sensor read time
-        time.sleep(0.1) 
+        sys.stderr.write("\b" * (toolbar_width + 1)) 
 
-    sys.stderr.write("]\n") # End progress bar
-    
-    print(">>> Resonance Core: Fitting Spectral Model...", file=sys.stderr)
+    if quiet:
+        for _ in range(200):
+            training_data.append(get_metrics(use_real=use_real, invert_sim=invert))
+            if use_real: time.sleep(0.05)
+    else:
+        for i in range(40):
+            for _ in range(5): 
+                training_data.append(get_metrics(use_real=use_real, invert_sim=invert))
+                if use_real: time.sleep(0.05)
+            sys.stderr.write("-")
+            sys.stderr.flush()
+        sys.stderr.write("]\n") 
+
     detector.fit(training_data)
-    time.sleep(0.5) # Slight pause for "Thinking". Remove for performance.
     
-    print(f">>> Resonance Core: Baseline Established on {len(training_data)} vectors. Engine Active.", file=sys.stderr)
+    if not quiet:
+        time.sleep(0.5) 
+        print(f">>> Resonance Core: Baseline Established. Engine Active.", file=sys.stderr)
+    
     return detector
 
-# --- MODE 1: HOLLYWOOD DASHBOARD (Rich UI) ---
-def run_dashboard(detector):
-    from rich.live import Live
-    from rich.table import Table
-    from rich.layout import Layout
-    from rich.panel import Panel
-    from rich.text import Text
-    from rich import box
+# --- MODE 1: HOLLYWOOD DASHBOARD ---
+def run_dashboard(detector, debouncer, use_real, invert):
+    try:
+        from rich.live import Live
+        from rich.table import Table
+        from rich.layout import Layout
+        from rich.panel import Panel
+        from rich import box
+    except ImportError:
+        print("Error: 'rich' library required for UI.")
+        sys.exit(1)
 
-    logs = []
-
-    # Helper function to create safe, scaled bars
     def make_bar(value, max_val, color="green"):
-        # Scale value to a max width of 20 characters
         width = 20
-        num_blocks = int((value / max_val) * width)
-        # Clamp between 1 (so it's always visible) and width
+        draw_val = min(value, max_val)
+        num_blocks = int((draw_val / max_val) * width)
         num_blocks = max(1, min(num_blocks, width))
-        
-        # Use a safe block character
         char = "|" 
         return f"[{color}]{char * num_blocks}[/{color}]"
 
-    def generate_ui(metrics, score, is_attack):
-        cpu, jitter, mem = metrics
-        
-        # Status Logic
-        if score == -1:
+    def generate_ui(metrics, raw_score, is_alert):
+        cpu = metrics[0]
+        if use_real:
+            mid_val, mid_label = metrics[1], "Net I/O (KB)"
+            bot_val, bot_label = metrics[2], "Disk I/O (KB)"
+            mid_max, bot_max = 5000.0, 5000.0 
+        else:
+            mid_val, mid_label = metrics[1], "Net Jitter"
+            bot_val, bot_label = metrics[2], "Memory"
+            mid_max, bot_max = 100.0, 100.0
+
+        if is_alert:
             status_style = "bold white on red"
             status_text = "CRITICAL THREAT DETECTED"
             border = "red"
         else:
-            status_style = "bold white on green"
-            status_text = "SYSTEM SECURE"
-            border = "green"
+            if raw_score == -1: 
+                status_style = "bold black on yellow"
+                status_text = "ANALYZING PATTERN..."
+                border = "yellow"
+            else:
+                status_style = "bold white on green"
+                status_text = "SYSTEM SECURE"
+                border = "green"
 
-        if is_attack and score == 1:
-            status_text = "ANALYZING PATTERN..."
-            status_style = "bold black on yellow"
-
-        # Table
         table = Table(box=box.ROUNDED, border_style=border, expand=True)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", justify="right")
         table.add_column("Graph", justify="left", width=25)
-        
-        # 1. CPU (Max expected ~100)
-        cpu_c = "red" if cpu > 50 else "green"
+         
+        cpu_c = "red" if cpu > 80 else "green"
         table.add_row("CPU Load", f"[{cpu_c}]{cpu:.1f}%[/{cpu_c}]", make_bar(cpu, 100, cpu_c))
         
-        # 2. Jitter (Max expected ~150, but normal is 5. Scale based on 100 for visibility)
-        jit_c = "red" if jitter > 20 else "green"
-        table.add_row("Net Jitter", f"[{jit_c}]{jitter:.1f}ms[/{jit_c}]", make_bar(jitter, 100, jit_c))
+        mid_c = "red" if mid_val > (mid_max * 0.8) else "green"
+        table.add_row(mid_label, f"[{mid_c}]{mid_val:.1f}[/{mid_c}]", make_bar(mid_val, mid_max, mid_c))
         
-        # 3. Memory (Max expected ~100)
-        mem_c = "red" if mem > 60 else "green"
-        table.add_row("Memory", f"[{mem_c}]{mem:.1f}%[/{mem_c}]", make_bar(mem, 100, mem_c))
+        bot_c = "red" if bot_val > (bot_max * 0.8) else "green"
+        table.add_row(bot_label, f"[{bot_c}]{bot_val:.1f}[/{bot_c}]", make_bar(bot_val, bot_max, bot_c))
 
         return Layout(
             Panel(table, title=f"[{status_style}] {status_text} [/{status_style}]", border_style=border),
@@ -131,71 +189,94 @@ def run_dashboard(detector):
     with Live(refresh_per_second=4) as live:
         while True:
             is_attack = os.path.exists(TRIGGER_FILE)
-            metrics = get_metrics(is_attack)
-            score = detector.score([metrics])[0]
+            metrics = get_metrics(is_attack, use_real, invert)
             
-            # Simple logging for UI
-            if score == -1:
-                logs.append(f"[ALERT] Deviation Detected")
+            raw_score = detector.score([metrics])[0]
             
-            live.update(generate_ui(metrics, score, is_attack))
+            debouncer.trigger(raw_score)
+            
+            is_alert = debouncer.count >= debouncer.threshold
+            
+            live.update(generate_ui(metrics, raw_score, is_alert))
             time.sleep(0.2)
 
-# --- MODE 2: SIMPLE STREAM (Verbose STDOUT) ---
-def run_stream(detector):
-    """Outputs a continuous log stream to STDOUT."""
-    print("timestamp,status,cpu,jitter,memory") # CSV Header
+# --- MODE 2: STRUCTURED STREAM ---
+def run_stream(detector, debouncer, use_json=False, use_real=False, invert=False):
+    if not use_json:
+        cols = "cpu,net_io,disk_io" if use_real else "cpu,jitter,memory"
+        print(f"timestamp,status,raw_score,{cols}") 
+    
     try:
         while True:
             is_attack = os.path.exists(TRIGGER_FILE)
-            metrics = get_metrics(is_attack)
-            score = detector.score([metrics])[0]
+            metrics = get_metrics(is_attack, use_real, invert)
             
-            timestamp = datetime.now().isoformat()
-            cpu, jitter, mem = metrics
+            raw_score = detector.score([metrics])[0]
             
-            status = "NORMAL" if score == 1 else "ANOMALY"
+            debouncer.trigger(raw_score)
             
-            # Formatted line
-            print(f"{timestamp},{status},{cpu:.2f},{jitter:.2f},{mem:.2f}")
+            is_alert = debouncer.count >= debouncer.threshold
+            status = "ANOMALY" if is_alert else "NORMAL"
+            
+            if use_json:
+                event = ResonanceEvent.build(
+                    score=raw_score,
+                    inputs=metrics,
+                    metadata={
+                        "host": "localhost", 
+                        "trigger_active": is_attack, 
+                        "mode": "REAL" if use_real else "SIM",
+                        "debounce_count": debouncer.count,
+                        "debounce_active": is_alert
+                    }
+                )
+                event["status"] = status
+                print(ResonanceEvent.to_json(event))
+            else:
+                from datetime import datetime
+                timestamp = datetime.now().isoformat()
+                v1, v2, v3 = metrics
+                print(f"{timestamp},{status},{raw_score},{v1:.2f},{v2:.2f},{v3:.2f}")
+            
             sys.stdout.flush()
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
 
-# --- MODE 3: PRODUCTION WATCHDOG (Quiet until Alert) ---
-def run_production(detector, halt_on_error):
-    """Silent until anomaly. Handles alerting and optional exit."""
+# --- MODE 3: PRODUCTION WATCHDOG ---
+def run_production(detector, debouncer, halt_on_error, use_real=False, invert=False):
     in_alarm_state = False
-    
     try:
         while True:
             is_attack = os.path.exists(TRIGGER_FILE)
-            metrics = get_metrics(is_attack)
-            score = detector.score([metrics])[0]
-            timestamp = datetime.now().isoformat()
-            cpu, jitter, mem = metrics
+            metrics = get_metrics(is_attack, use_real, invert)
+            raw_score = detector.score([metrics])[0]
 
-            # ANOMALY DETECTED
-            if score == -1:
-                if not in_alarm_state:
-                    # RISING EDGE (New Alarm)
-                    print(f"{{'level': 'CRITICAL', 'time': '{timestamp}', 'msg': 'Anomaly Detected', 'metrics': {{'cpu': {cpu:.1f}, 'jitter': {jitter:.1f}}}}}")
-                    sys.stdout.flush()
-                    in_alarm_state = True
-                    
-                    if halt_on_error:
-                        print(f"{{'level': 'FATAL', 'time': '{timestamp}', 'msg': 'Halt on Error configured. Exiting.'}}")
-                        sys.exit(1)
-                else:
-                    # Still in alarm state... silence or heartbeat? 
-                    # Usually keep quiet to reduce log spam, or log every N seconds.
-                    pass
+            is_rising_edge = debouncer.trigger(raw_score)
+            is_alert = debouncer.count >= debouncer.threshold
 
-            # RECOVERY DETECTED
-            elif score == 1 and in_alarm_state:
-                # FALLING EDGE (Recovery)
-                print(f"{{'level': 'INFO', 'time': '{timestamp}', 'msg': 'Anomaly Resolved. System Normal.'}}")
+            if is_rising_edge and not in_alarm_state:
+                event = ResonanceEvent.build(
+                    score=raw_score, 
+                    inputs=metrics, 
+                    metadata={"level": "CRITICAL", "msg": "Anomaly Threshold Breached"}
+                )
+                event["status"] = "ANOMALY"
+                print(ResonanceEvent.to_json(event))
+                sys.stdout.flush()
+                in_alarm_state = True
+                
+                if halt_on_error:
+                    sys.exit(1)
+
+            elif not is_alert and in_alarm_state:
+                event = ResonanceEvent.build(
+                    score=raw_score, 
+                    inputs=metrics, 
+                    metadata={"level": "INFO", "msg": "System Recovered"}
+                )
+                event["status"] = "NORMAL"
+                print(ResonanceEvent.to_json(event))
                 sys.stdout.flush()
                 in_alarm_state = False
             
@@ -204,32 +285,44 @@ def run_production(detector, halt_on_error):
     except KeyboardInterrupt:
         pass
 
-# --- MAIN ENTRY POINT ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Resonance Biometric CLI")
+    parser = argparse.ArgumentParser(description="Resonance Biometric Engine CLI (v0.2.0)")
     
-    # Mode selection
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--ui", action="store_true", help="Launch the Visual Dashboard (Default)")
-    group.add_argument("--stream", action="store_true", help="Output verbose logs to STDOUT (No UI)")
-    group.add_argument("--prod", action="store_true", help="Production Mode: Quiet until anomaly detected")
+    group.add_argument("--ui", action="store_true", help="Launch Visual Dashboard")
+    group.add_argument("--stream", action="store_true", help="Output verbose CSV logs")
+    group.add_argument("--json", action="store_true", help="Output verbose JSON logs (New v0.2.0 Schema)")
+    group.add_argument("--prod", action="store_true", help="Production Mode: Quiet until anomaly")
     
-    # Options
-    parser.add_argument("--halt", action="store_true", help="In Production mode, exit process immediately on detection")
+    parser.add_argument("--halt", action="store_true", help="Halt on error (Prod mode)")
+    parser.add_argument("--real", action="store_true", help="Use REAL hardware metrics (requires psutil)")
+    # FIXED: Added --retrain so the command doesn't crash
+    parser.add_argument("--retrain", action="store_true", help="Force retraining of the baseline model (Default behavior)")
+    parser.add_argument("--sensitivity", type=float, default=0.02, help="Anomaly threshold (0.001 - 0.5). Default 0.02")
+    parser.add_argument("--threshold", type=int, default=5, help="Debounce: Anomalies required to trigger alert")
+    parser.add_argument("--window", type=int, default=60, help="Debounce: Window size in seconds")
+    parser.add_argument("--invert", action="store_true", help="SIM ONLY: Normal = High Load, Attack = Crash (Zero)")
 
     args = parser.parse_args()
+    
+    if args.real and not PSUTIL_AVAILABLE:
+        print("Error: --real requested but 'psutil' not found. Run 'pip install psutil'")
+        sys.exit(1)
 
-    # 1. Train first (common to all modes)
-    engine = train_engine()
+    quiet_mode = args.json or args.stream or args.prod
+    
+    # 1. Train
+    engine = train_engine(quiet=quiet_mode, use_real=args.real, sensitivity=args.sensitivity, invert=args.invert)
 
-    # 2. Dispatch
+    # 2. Init Debouncer
+    gate = Debouncer(threshold=args.threshold, window_seconds=args.window)
+
+    # 3. Run
     if args.stream:
-        run_stream(engine)
+        run_stream(engine, gate, use_json=False, use_real=args.real, invert=args.invert)
+    elif args.json:
+        run_stream(engine, gate, use_json=True, use_real=args.real, invert=args.invert)
     elif args.prod:
-        run_production(engine, args.halt)
+        run_production(engine, gate, args.halt, use_real=args.real, invert=args.invert)
     else:
-        # Default to UI
-        try:
-            run_dashboard(engine)
-        except ImportError:
-            print("Error: 'rich' library not found. Run 'pip install rich' or use --stream mode.")
+        run_dashboard(engine, gate, use_real=args.real, invert=args.invert)
