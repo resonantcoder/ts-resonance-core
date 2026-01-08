@@ -2,9 +2,9 @@ from setuptools import setup, find_packages
 
 setup(
     name="ts-resonance-core",
-    version="0.1.0",
+    version="0.2.0",
     description="Spectral anomaly detection for time-series data.",
-    author="ResonanceArchitect",
+    author="ResonantCoder",
     author_email="123456+ResonanceArchitect@users.noreply.github.com",
     packages=find_packages(),
     install_requires=[
