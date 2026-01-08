@@ -13,11 +13,8 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
-# --- CONFIGURATION ---
 TRIGGER_FILE = "trigger.txt"
 
-# --- GLOBALS FOR REAL METRICS ---
-# We need to track the previous I/O counters to calculate deltas (speed)
 _last_net_io = 0
 _last_disk_io = 0
 _first_run_io = True
@@ -32,15 +29,11 @@ def get_metrics(is_attack=False, use_real=False, invert_sim=False):
     global _last_net_io, _last_disk_io, _first_run_io
     
     if use_real and PSUTIL_AVAILABLE:
-        # 1. CPU (Blocking call if interval provided, but we assume interval=None for speed here)
-        # Note: First call to cpu_percent with interval=None returns 0.0, which is fine for init.
         real_cpu = psutil.cpu_percent(interval=None)
         
-        # 2. Network I/O (Bytes -> KB delta)
         net_counters = psutil.net_io_counters()
         curr_net = net_counters.bytes_sent + net_counters.bytes_recv
         
-        # 3. Disk I/O (Bytes -> KB delta)
         disk_counters = psutil.disk_io_counters()
         curr_disk = disk_counters.read_bytes + disk_counters.write_bytes
         
@@ -48,7 +41,6 @@ def get_metrics(is_attack=False, use_real=False, invert_sim=False):
             _last_net_io = curr_net
             _last_disk_io = curr_disk
             _first_run_io = False
-            # Return baseline 0s on first tick to avoid massive initialization spikes
             return [real_cpu, 0.0, 0.0]
 
         net_delta = (curr_net - _last_net_io) / 1024.0
@@ -57,18 +49,12 @@ def get_metrics(is_attack=False, use_real=False, invert_sim=False):
         _last_net_io = curr_net
         _last_disk_io = curr_disk
 
-        # TODO: Cap deltas to avoid scientific notation/messy logs if they are huge? 
-        # For now, we leave them raw.
-
-        # INJECTION: If attack mode, simulate massive Network spike (DDoS)
         if is_attack:
             net_delta += np.random.normal(5000, 1000)
 
         return [real_cpu, net_delta, disk_delta]
     
     else:
-        # 2. PURE SIMULATION
-        # Define profiles
         low_profile = [
             np.random.normal(15, 0.5), # Low CPU
             np.random.normal(5, 0.2),  # Low Jitter
@@ -81,10 +67,8 @@ def get_metrics(is_attack=False, use_real=False, invert_sim=False):
         ]
 
         if invert_sim:
-            # "Normal" is High Load. "Attack" is a Crash (Low Load).
             return low_profile if is_attack else high_profile
         else:
-            # "Normal" is Idle. "Attack" is a Spike.
             return high_profile if is_attack else low_profile
 
 # --- SHARED: TRAINING ---
@@ -95,22 +79,17 @@ def train_engine(quiet=False, use_real=False, sensitivity=0.02, invert=False):
         print(">>> Resonance Core v0.2.0: Initializing...", file=sys.stderr)
         time.sleep(1) 
     
-    # SAFETY CHECK: Don't train on a busy machine
     if use_real and PSUTIL_AVAILABLE:
-        # Check instantaneous load
         check_cpu = psutil.cpu_percent(interval=1.0)
         if check_cpu > 25.0:
              if not quiet:
                 print(f"!!! WARNING: High CPU Load detected ({check_cpu}%).", file=sys.stderr)
                 print("!!! Training on a busy system will mark high load as 'Normal'.", file=sys.stderr)
-                print("!!! Recommend stopping stress tests before calibration.", file=sys.stderr)
                 time.sleep(2)
 
     detector = SpectralDetector(mode='statistical', contamination=sensitivity)
-    
     training_data = []
     
-    # Priming the I/O counters (discard first result)
     get_metrics(use_real=use_real, invert_sim=invert)
     time.sleep(0.1)
 
@@ -122,7 +101,6 @@ def train_engine(quiet=False, use_real=False, sensitivity=0.02, invert=False):
         sys.stderr.flush()
         sys.stderr.write("\b" * (toolbar_width + 1)) 
 
-    # Collect 200 samples
     if quiet:
         for _ in range(200):
             training_data.append(get_metrics(use_real=use_real, invert_sim=invert))
@@ -134,7 +112,6 @@ def train_engine(quiet=False, use_real=False, sensitivity=0.02, invert=False):
                 if use_real: time.sleep(0.05)
             sys.stderr.write("-")
             sys.stderr.flush()
- 
         sys.stderr.write("]\n") 
 
     detector.fit(training_data)
@@ -159,7 +136,6 @@ def run_dashboard(detector, debouncer, use_real, invert):
 
     def make_bar(value, max_val, color="green"):
         width = 20
-        # Clamp value to max_val for visual stability
         draw_val = min(value, max_val)
         num_blocks = int((draw_val / max_val) * width)
         num_blocks = max(1, min(num_blocks, width))
@@ -167,12 +143,10 @@ def run_dashboard(detector, debouncer, use_real, invert):
         return f"[{color}]{char * num_blocks}[/{color}]"
 
     def generate_ui(metrics, raw_score, is_alert):
-        # Unpack based on mode
         cpu = metrics[0]
         if use_real:
             mid_val, mid_label = metrics[1], "Net I/O (KB)"
             bot_val, bot_label = metrics[2], "Disk I/O (KB)"
-            # Scale maxes for IO visualization (arbitrary heuristic for UI)
             mid_max, bot_max = 5000.0, 5000.0 
         else:
             mid_val, mid_label = metrics[1], "Net Jitter"
@@ -185,7 +159,6 @@ def run_dashboard(detector, debouncer, use_real, invert):
             border = "red"
         else:
             if raw_score == -1: 
-                # Debouncer is absorbing the hit
                 status_style = "bold black on yellow"
                 status_text = "ANALYZING PATTERN..."
                 border = "yellow"
@@ -220,16 +193,8 @@ def run_dashboard(detector, debouncer, use_real, invert):
             
             raw_score = detector.score([metrics])[0]
             
-            # Debounce Logic: 
-            # If raw_score is -1, trigger 'strike'. 
-            # If debouncer counts enough strikes, is_alert becomes True.
-            if raw_score == -1:
-                debouncer.trigger()
+            debouncer.trigger(raw_score)
             
-            # Check the gate state (based on window count)
-            # We access the internal count/threshold logic via property if available, 
-            # or rely on trigger()'s rising edge. 
-            # However, simpler to just check if count >= threshold
             is_alert = debouncer.count >= debouncer.threshold
             
             live.update(generate_ui(metrics, raw_score, is_alert))
@@ -238,7 +203,6 @@ def run_dashboard(detector, debouncer, use_real, invert):
 # --- MODE 2: STRUCTURED STREAM ---
 def run_stream(detector, debouncer, use_json=False, use_real=False, invert=False):
     if not use_json:
-        # Dynamic headers based on mode
         cols = "cpu,net_io,disk_io" if use_real else "cpu,jitter,memory"
         print(f"timestamp,status,raw_score,{cols}") 
     
@@ -249,11 +213,8 @@ def run_stream(detector, debouncer, use_json=False, use_real=False, invert=False
             
             raw_score = detector.score([metrics])[0]
             
-            # Feed the debouncer
-            if raw_score == -1:
-                debouncer.trigger()
+            debouncer.trigger(raw_score)
             
-            # Determine actual Alert State
             is_alert = debouncer.count >= debouncer.threshold
             status = "ANOMALY" if is_alert else "NORMAL"
             
@@ -269,14 +230,12 @@ def run_stream(detector, debouncer, use_json=False, use_real=False, invert=False
                         "debounce_active": is_alert
                     }
                 )
-                # Override the high-level status based on Debouncer, not raw score
                 event["status"] = status
                 print(ResonanceEvent.to_json(event))
             else:
                 from datetime import datetime
                 timestamp = datetime.now().isoformat()
                 v1, v2, v3 = metrics
-                # Simple CSV Output
                 print(f"{timestamp},{status},{raw_score},{v1:.2f},{v2:.2f},{v3:.2f}")
             
             sys.stdout.flush()
@@ -293,13 +252,10 @@ def run_production(detector, debouncer, halt_on_error, use_real=False, invert=Fa
             metrics = get_metrics(is_attack, use_real, invert)
             raw_score = detector.score([metrics])[0]
 
-            if raw_score == -1:
-                debouncer.trigger()
-
+            is_rising_edge = debouncer.trigger(raw_score)
             is_alert = debouncer.count >= debouncer.threshold
 
-            # RISING EDGE (Normal -> Anomaly)
-            if is_alert and not in_alarm_state:
+            if is_rising_edge and not in_alarm_state:
                 event = ResonanceEvent.build(
                     score=raw_score, 
                     inputs=metrics, 
@@ -313,8 +269,6 @@ def run_production(detector, debouncer, halt_on_error, use_real=False, invert=Fa
                 if halt_on_error:
                     sys.exit(1)
 
-            # FALLING EDGE (Anomaly -> Normal)
-            # If debouncer count drops below threshold, we recover
             elif not is_alert and in_alarm_state:
                 event = ResonanceEvent.build(
                     score=raw_score, 
@@ -342,13 +296,11 @@ if __name__ == "__main__":
     
     parser.add_argument("--halt", action="store_true", help="Halt on error (Prod mode)")
     parser.add_argument("--real", action="store_true", help="Use REAL hardware metrics (requires psutil)")
+    # FIXED: Added --retrain so the command doesn't crash
+    parser.add_argument("--retrain", action="store_true", help="Force retraining of the baseline model (Default behavior)")
     parser.add_argument("--sensitivity", type=float, default=0.02, help="Anomaly threshold (0.001 - 0.5). Default 0.02")
-    
-    # NEW: Debouncer Config
-    parser.add_argument("--threshold", type=int, default=5, help="Debouncer: Anomalies required to trigger alert")
-    parser.add_argument("--window", type=int, default=60, help="Debouncer: Window size in seconds")
-
-    # NEW: Invert Simulation Profile
+    parser.add_argument("--threshold", type=int, default=5, help="Debounce: Anomalies required to trigger alert")
+    parser.add_argument("--window", type=int, default=60, help="Debounce: Window size in seconds")
     parser.add_argument("--invert", action="store_true", help="SIM ONLY: Normal = High Load, Attack = Crash (Zero)")
 
     args = parser.parse_args()
